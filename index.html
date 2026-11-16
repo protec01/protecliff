@@ -407,33 +407,69 @@ $('source_type').addEventListener('change', (e) => {
 });
 
 // ================= รูปภาพ (สูงสุด MAX_IMAGES รูป) =================
-function resizeImage(file, maxWidth, quality) {
+// ตั้งค่าการลดขนาดรูป
+const MAX_SIDE = 1280;             // ด้านที่ยาวที่สุดของรูป (พิกเซล)
+const TARGET_BYTES = 400 * 1024;   // ขนาดเป้าหมายต่อรูป ประมาณ 400 KB
+const MIN_QUALITY = 0.5;           // คุณภาพ JPEG ต่ำสุดที่ยอมลด
+const MIN_SIDE = 800;              // ย่อด้านยาวได้ต่ำสุดเท่านี้
+
+// เปิดรูปแบบประหยัดหน่วยความจำ และหมุนรูปตามข้อมูลการถ่าย (EXIF) ให้ถูกทิศ
+async function loadBitmap(file) {
+  if (window.createImageBitmap) {
+    try { return await createImageBitmap(file, { imageOrientation: 'from-image' }); } catch (e) { /* ใช้วิธีสำรอง */ }
+  }
   return new Promise((resolve, reject) => {
-    if (!file.type.match(/image.*/)) return reject(new Error('Not an image'));
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const image = new Image();
-      image.onload = () => {
-        let w = image.width, h = image.height;
-        if (w > maxWidth) { h *= maxWidth / w; w = maxWidth; }
-        const canvas = document.createElement('canvas');
-        canvas.width = w; canvas.height = h;
-        canvas.getContext('2d').drawImage(image, 0, 0, w, h);
-        canvas.toBlob((blob) => {
-          if (!blob) return reject(new Error('Canvas is empty'));
-          resolve(new File([blob], file.name, { type: 'image/jpeg', lastModified: Date.now() }));
-        }, 'image/jpeg', quality);
-      };
-      image.onerror = () => reject(new Error('Image load error'));
-      image.src = ev.target.result;
-    };
-    reader.onerror = () => reject(new Error('File read error'));
-    reader.readAsDataURL(file);
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Image load error')); };
+    img.src = url;
   });
 }
 
+function canvasToBlob(canvas, quality) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((b) => b ? resolve(b) : reject(new Error('Canvas is empty')), 'image/jpeg', quality);
+  });
+}
+
+// ลดขนาดรูปให้ไม่เกิน TARGET_BYTES: ย่อด้านยาวเหลือไม่เกิน MAX_SIDE ก่อน
+// แล้วลดคุณภาพทีละขั้น หากยังใหญ่เกินจึงย่อขนาดลงอีกจนถึง MIN_SIDE
+async function compressImage(file) {
+  if (!file.type.match(/image.*/)) throw new Error('Not an image');
+  const src = await loadBitmap(file);
+  const sw = src.naturalWidth || src.width;
+  const sh = src.naturalHeight || src.height;
+  const canvas = document.createElement('canvas');
+  let side = Math.min(MAX_SIDE, Math.max(sw, sh));
+  let blob;
+  try {
+    while (true) {
+      const scale = Math.min(1, side / Math.max(sw, sh));
+      canvas.width = Math.round(sw * scale);
+      canvas.height = Math.round(sh * scale);
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#ffffff';                       // รูป PNG โปร่งใสให้พื้นหลังเป็นสีขาว
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(src, 0, 0, canvas.width, canvas.height);
+      for (let q = 0.8; q >= MIN_QUALITY - 1e-9; q -= 0.1) {
+        blob = await canvasToBlob(canvas, q);
+        if (blob.size <= TARGET_BYTES) break;
+      }
+      if (blob.size <= TARGET_BYTES || side <= MIN_SIDE) break;
+      side = Math.max(MIN_SIDE, Math.round(side * 0.85));
+    }
+  } finally {
+    if (src.close) src.close();
+    canvas.width = canvas.height = 0;                  // คืนหน่วยความจำ
+  }
+  return new File([blob], file.name.replace(/\.\w+$/, '') + '.jpg', { type: 'image/jpeg', lastModified: Date.now() });
+}
+
 function updateImageLabel() {
-  $('image_label').textContent = `เพิ่มรูปภาพประกอบ (${files.length}/${MAX_IMAGES} รูป)`;
+  const mb = files.reduce((n, f) => n + f.size, 0) / 1048576;
+  $('image_label').textContent =
+    `เพิ่มรูปภาพประกอบ (${files.length}/${MAX_IMAGES} รูป` + (files.length ? ` · รวม ${mb.toFixed(1)} MB)` : ')');
 }
 
 function renderPreviews() {
@@ -479,10 +515,12 @@ $('images').addEventListener('change', async (e) => {
   imageBusy = true;
   $('image_label').textContent = '⚡ กำลังบีบอัดรูปภาพ...';
   try {
+    let failed = 0;
     for (const file of picked.slice(0, remaining)) {
-      try { files.push(await resizeImage(file, 1280, 0.8)); }
-      catch (err) { console.error('Resize error:', err); }
+      try { files.push(await compressImage(file)); }
+      catch (err) { failed++; console.error('Resize error:', err); }
     }
+    if (failed) alert(`ไม่สามารถประมวลผลรูปได้ ${failed} รูป กรุณาลองเลือกรูปนั้นใหม่อีกครั้ง`);
   } finally {
     imageBusy = false;
     renderPreviews();
